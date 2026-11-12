@@ -1,0 +1,140 @@
+---
+title: "IMDb Rankings"
+author: "Solenia Suarez"
+execute:
+  echo: false
+---
+
+```{r}
+#| message: false
+library(tidyverse)
+library(rvest)
+library(httr2)
+library(purrr)
+```
+
+```{r}
+#| cache: true
+imdb_urls <- c(
+  "https://web.archive.org/web/20150101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20170101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20190101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20210101/https://www.imdb.com/chart/top/",
+  "https://web.archive.org/web/20220201012049/https://www.imdb.com/chart/top/"
+)
+imdb_years <- c(2015, 2017, 2019, 2021, 2022)
+
+fetch_imdb_snapshot <- \(address, snapshot_year) {
+  response <- request(address) |>
+    req_timeout(120) |>
+    req_retry(max_tries = 3, retry_on_failure = TRUE) |>
+    req_perform()
+
+  document <- resp_body_html(response)
+  page_tables <- html_elements(document, "table")
+  table_data <- map(page_tables, html_table)
+  ranking_table_index <- which(
+    map_lgl(
+      table_data,
+      \(table) all(c("Rank & Title", "IMDb Rating") %in% names(table))
+    )
+  )
+
+  if (length(ranking_table_index) != 1) {
+    stop("Expected one IMDb ranking table; found ", length(ranking_table_index))
+  }
+
+  ranking_table <- page_tables[[ranking_table_index]]
+  ranking_data <- table_data[[ranking_table_index]] |>
+    select(`Rank & Title`, `IMDb Rating`) |>
+    mutate(`Rank & Title` = str_squish(`Rank & Title`)) |>
+    separate_wider_regex(
+      `Rank & Title`,
+      patterns = c(
+        rank = "\\d+",
+        "\\. ",
+        title = ".+",
+        " \\(",
+        year = "\\d{4}",
+        "\\)"
+      )
+    )
+
+  if (nrow(ranking_data) != 250L) {
+    stop("Expected 250 IMDb rankings; found ", nrow(ranking_data))
+  }
+
+  vote_counts <- html_elements(ranking_table, "td.imdbRating strong") |>
+    html_attr("title") |>
+    str_extract("[0-9,]+(?= votes)") |>
+    parse_number()
+
+  if (nrow(ranking_data) != length(vote_counts)) {
+    stop("The ranking rows and vote-count tooltips do not match")
+  }
+
+  tibble(
+    snap_year = rep(as.integer(snapshot_year), nrow(ranking_data)),
+    rank = as.integer(ranking_data$rank),
+    title = ranking_data$title,
+    year = as.integer(ranking_data$year),
+    rating = parse_number(as.character(ranking_data$`IMDb Rating`)),
+    number = vote_counts
+  )
+}
+
+imdb_snapshots <- map2_dfr(imdb_urls, imdb_years, fetch_imdb_snapshot)
+imdb_rank_changes <- imdb_snapshots |>
+  filter(snap_year %in% c(2015, 2022)) |>
+  select(snap_year, title, year, rank) |>
+  pivot_wider(names_from = snap_year, values_from = rank, names_prefix = "rank_") |>
+  filter(!is.na(rank_2015), !is.na(rank_2022)) |>
+  mutate(rank_change = rank_2015 - rank_2022) |>
+  mutate(release_decade = floor(year / 10) * 10)
+
+print(
+  imdb_rank_changes |>
+    arrange(desc(abs(rank_change))) |>
+    slice_head(n = 10)
+)
+
+imdb_rank_changes |>
+  group_by(release_decade) |>
+  summarize(avg_rank_change = mean(rank_change), .groups = "drop") |>
+  arrange(release_decade)
+imdb_snapshots |>
+  count(title, name = "n_snapshots") |>
+  count(n_snapshots, name = "n_films")
+```
+
+```{r}
+imdb_rank_changes |>
+  group_by(release_decade) |>
+  summarize(avg_rank_change = mean(rank_change), .groups = "drop") |>
+  mutate(
+    direction = case_when(
+      avg_rank_change > 0 ~ "Improved rank",
+      avg_rank_change < 0 ~ "Declined rank",
+      TRUE ~ "No average change"
+    ),
+    release_decade = factor(release_decade)
+  ) |>
+  ggplot(aes(x = avg_rank_change, y = release_decade, fill = direction)) +
+  geom_col() +
+  geom_vline(xintercept = 0, color = "gray40") +
+  scale_fill_manual(
+    values = c(
+      "Improved rank" = "#2878B5",
+      "Declined rank" = "#D9534F",
+      "No average change" = "gray60"
+    )
+  ) +
+  labs(
+    title = "Average IMDb Rank Change by Film Release Decade",
+    subtitle = "Positive values indicate an improved rank from 2015 to 2022",
+    x = "Average rank change (2015 rank minus 2022 rank)",
+    y = "Release decade",
+    fill = "Direction",
+    caption = "Sample: 190 films appear in both the 2015 and 2022 snapshots."
+  )
+```
